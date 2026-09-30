@@ -1,0 +1,1234 @@
+# PostgreSQL DBA — Master Revision Notes
+
+Interview-focused • Performance • HA • Replication • Backup • Internals • Troubleshooting
+
+> ⭐ Use this as a final-review document: understand the concept first, then memorize the one-line interview answer.
+
+This version consolidates the material from the uploaded 96-page notes, removes repeated explanations, groups related topics together, and keeps the corrected versions already present in the notes. It is designed so that one read gives you a complete DBA revision map.
+
+Source basis: uploaded My_Notes.docx. The original notes cover PostgreSQL architecture, security, configuration, performance, indexes, MVCC, WAL, replication, backups/PITR, pgBackRest, PgBouncer, HA, AWS basics, troubleshooting, SQL fundamentals and interview questions.
+
+## How to use this document
+
+- First pass: read headings + ⭐ memory lines.
+- Second pass: read the tables and interview answers.
+- Before an interview: revise the Last-Minute Cheat Sheet and Scenario-Based Answers.
+- If asked for details, expand from the relevant section instead of trying to memorize every command.
+
+## Master topic map
+
+| # | Area | What you should be able to explain |
+|---|---|---|
+| 1 | Architecture & query flow | Connection → authentication → parser → analyzer → rewrite → planner → executor |
+| 2 | Security & roles | pg_hba.conf, privileges, predefined roles, users/roles |
+| 3 | Configuration | postgresql.conf, auto.conf, include files, pg_settings, contexts |
+| 4 | Memory & parameters | shared_buffers, work_mem, maintenance_work_mem, effective_cache_size |
+| 5 | Query performance | EXPLAIN, BUFFERS, statistics, scans, joins, planner costs |
+| 6 | Indexes | B-tree, Hash, GiST, SP-GiST, GIN, BRIN; index scan vs bitmap scan |
+| 7 | VACUUM & autovacuum | dead tuples, bloat, ANALYZE, freeze, wraparound |
+| 8 | MVCC & transactions | xmin/xmax, snapshots, XID wraparound, locks, deadlocks |
+| 9 | Storage internals | data directory, FSM, VM, TOAST, tablespaces |
+| 10 | WAL & checkpoints | WAL, buffers, checkpoint, pg_waldump, pg_stat_wal |
+| 11 | Streaming replication | sender/receiver, LSNs, slots, lag, failover |
+| 12 | Logical replication | publisher/subscriber, workers, publications/subscriptions |
+| 13 | HA | Patroni, DCS, HAProxy, repmgr, pg_rewind |
+| 14 | Backup & recovery | pg_dump, pg_basebackup, WAL archive, PITR |
+| 15 | pgBackRest | stanza, full/diff/incr, restore, PITR, retention |
+| 16 | PgBouncer | pooling modes, sizing, troubleshooting |
+| 17 | Partitioning & extensions | partition pruning, common extensions |
+| 18 | Monitoring & troubleshooting | views, OS checks, DBA workflow |
+| 19 | AWS basics | EC2, EBS, S3, RDS, VPC, SG, IAM, CloudWatch |
+| 20 | SQL fundamentals | keys, views, procedures, functions, triggers, normalization |
+
+# 1. PostgreSQL Architecture & Query Processing
+
+## 1.1 Connection-to-result flow
+
+```text
+Application
+   │
+   │ SQL connection / query
+   ▼
+PostgreSQL server
+   │
+   ▼
+Connection manager / postmaster
+   │
+   ├── Check pg_hba.conf
+   │      └── Authentication / access allowed?
+   │
+   ▼
+Backend process
+   │
+   ▼
+Parser
+   ├── Lexing / syntax check
+   └── Parse tree
+   ▼
+Analyzer / Transformer
+   ├── Resolve tables / columns / data types
+   └── Query tree
+   ▼
+Rewriter
+   └── Rules / view expansion
+   ▼
+Planner / Optimizer
+   ├── Seq Scan
+   ├── Index Scan
+   ├── Bitmap Scan
+   ├── Nested Loop
+   ├── Hash Join
+   └── Merge Join
+   │
+   └── Choose lowest estimated cost
+   ▼
+Executor
+   ├── Shared buffers / storage
+   └── Return rows
+   ▼
+Application
+```
+
+> ⭐ Connection → pg_hba.conf → Backend → Parse → Analyze → Rewrite → Plan → Execute → Result
+
+## 1.2 Important architecture components
+
+| Component | Purpose |
+|---|---|
+| Postmaster / main server process | Manages connections and background processes. |
+| Backend process | Handles a client session/query. |
+| Shared buffers | PostgreSQL's main shared cache for data pages. |
+| WAL buffers | Memory area where WAL records are held before being written to WAL files. |
+| Heap | Main table storage. |
+| Index | Separate access structure used to find table rows efficiently. |
+| TOAST | Stores oversized column values outside the normal row storage. |
+| Background processes | Handle tasks such as WAL writing, checkpoints, autovacuum and statistics/maintenance work. |
+
+## 1.3 pg_hba.conf vs listen_addresses
+
+| Parameter/file | Question answered |
+|---|---|
+| listen_addresses | On which server IP interfaces should PostgreSQL listen? |
+| pg_hba.conf | Which client/database/user/address is allowed and how is it authenticated? |
+
+listen_addresses accepts IP addresses or '*' — not CIDR subnet ranges. CIDR ranges belong in the ADDRESS field of pg_hba.conf.
+
+# 2. PostgreSQL Security, Users, Roles & Privileges
+
+## 2.1 Three security layers
+
+| Layer | Question | Main control |
+|---|---|---|
+| 1. Connection | Can you connect at all? | pg_hba.conf + listen_addresses |
+| 2. Database/schema | What can you use after connecting? | CONNECT, CREATE, USAGE |
+| 3. Object | What can you do to the data? | SELECT, INSERT, UPDATE, DELETE, etc. |
+
+## 2.2 Common pg_hba.conf methods
+
+| Method | Meaning |
+|---|---|
+| trust | Allows connection without password; dangerous for production. |
+| password | Password authentication; use securely, preferably with SSL. |
+| md5 | Legacy password authentication. |
+| scram-sha-256 | Modern password authentication; preferred for new setups. |
+
+```sql
+SELECT pg_reload_conf();
+
+REVOKE CONNECT, CREATE ON DATABASE pdb FROM PUBLIC;
+GRANT CONNECT ON DATABASE pdb TO app_user;
+
+GRANT USAGE ON SCHEMA public TO app_user;
+GRANT SELECT, INSERT, UPDATE, DELETE ON employee TO app_user;
+```
+
+## 2.3 Users, roles and groups
+
+Since PostgreSQL 8.1, users, roles and groups are represented by the same underlying role system. The practical difference is mainly default attributes.
+
+| Command | Default behavior |
+|---|---|
+| CREATE USER | Creates a role with LOGIN by default. |
+| CREATE ROLE | Creates a role with NOLOGIN by default. |
+| CREATE GROUP | Same underlying role concept; NOLOGIN by default. |
+
+## 2.4 Important role attributes
+
+| Attribute | Meaning |
+|---|---|
+| LOGIN | Role can connect to PostgreSQL. |
+| SUPERUSER | Bypasses normal permission checks. |
+| CREATEDB | Can create databases. |
+| CREATEROLE | Can create/manage roles. |
+| REPLICATION | Can perform replication-related connections/operations. |
+| PASSWORD | Authentication credential for password-based login. |
+
+## 2.5 Predefined roles to remember
+
+| Role | Interview meaning |
+|---|---|
+| pg_database_owner | Dynamic role containing the current database owner. |
+| pg_read_all_stats | Can view statistics/activity for other users. |
+| pg_read_all_settings | Can view configuration settings, including normally restricted settings. |
+| pg_read_all_data | Read-only access to all tables/views/sequences and schema usage; still needs CONNECT. |
+| pg_write_all_data | Write access counterpart to pg_read_all_data. |
+| pg_monitor | Bundle of monitoring-related predefined roles. |
+| pg_signal_backend | Allows permitted cancellation/termination of other non-superuser backends. |
+| pg_checkpoint | Allows a non-superuser to run CHECKPOINT. |
+| pg_maintain | Maintenance operations such as VACUUM, ANALYZE, CLUSTER, REINDEX and related operations without table ownership; added in PG17. |
+| pg_read_server_files | Read server-side files. |
+| pg_write_server_files | Write/export to server-side files. |
+| pg_execute_server_program | Run server-side programs through supported operations such as COPY PROGRAM. |
+| pg_use_reserved_connections | Use reserved connection slots when normal connection capacity is exhausted. |
+
+## 2.6 Useful security/monitoring views
+
+```sql
+SELECT * FROM pg_stat_activity;
+SELECT * FROM pg_settings;
+SELECT * FROM pg_db_role_settings;
+SELECT * FROM pg_shadow;   -- superuser-restricted view; pg_authid is underlying source
+```
+
+> ⭐ pg_hba.conf = can I connect?  Privileges = what can I do after connecting?
+
+# 3. PostgreSQL Configuration
+
+## 3.1 Main configuration files
+
+| File | Purpose |
+|---|---|
+| postgresql.conf | Main instance-level configuration. |
+| postgresql.auto.conf | Stores ALTER SYSTEM changes; read after postgresql.conf and therefore overrides it. |
+| pg_hba.conf | Client authentication rules; not managed by ALTER SYSTEM. |
+| pg_ident.conf | Maps external/OS usernames to PostgreSQL roles when used with pg_hba.conf map rules. |
+
+## 3.2 Split configuration
+
+```text
+include_dir = 'conf.d'
+include_file = 'memory.conf'
+include = 'autovacuum.conf'
+```
+
+- include_dir can contain multiple configuration files; files are read in filename order.
+- include_file refers to one file. For multiple specific files, use multiple include_file/include directives or a directory.
+- ALTER SYSTEM writes to postgresql.auto.conf.
+```sql
+ALTER SYSTEM RESET work_mem;
+ALTER SYSTEM RESET ALL;
+
+SELECT pg_reload_conf();
+
+SELECT name, setting, sourcefile, sourceline
+FROM pg_settings;
+```
+
+## 3.3 pg_settings vs pg_db_role_settings
+
+| View | Use |
+|---|---|
+| pg_settings | Shows the effective runtime setting and useful metadata such as source file and context. |
+| pg_db_role_settings | Shows settings applied specifically through ALTER DATABASE ... SET and ALTER ROLE ... SET. |
+
+## 3.4 Configuration context — interview version
+
+| Context | Meaning | Examples |
+|---|---|---|
+| internal | Fixed; cannot be changed at runtime. | block_size, server_version |
+| postmaster | Requires full restart. | shared_buffers, max_connections, wal_level, port |
+| sighup | Change config + reload. | many logging/checkpoint settings |
+| backend / superuser-backend | Takes effect at backend/session start, with privilege requirements depending on parameter. | session-start parameters |
+| superuser | Superuser can change it in a session. | parameter-dependent |
+| user | User can SET it for their session. | work_mem, search_path, statement_timeout |
+
+> ⭐ Before changing a parameter: SELECT name, setting, context FROM pg_settings WHERE name='parameter_name';
+
+# 4. Memory & Important Performance Parameters
+
+| Parameter | Purpose | Remember |
+|---|---|---|
+| shared_buffers | PostgreSQL's internal cache. | Actual memory allocation. |
+| work_mem | Memory per operation such as sort/hash; can be used multiple times by one query and across sessions. | Dynamic; do not multiply it only by max_connections without considering actual operations/concurrency. |
+| maintenance_work_mem | Memory for maintenance operations such as VACUUM and index creation. | Maintenance, not normal query sorting. |
+| autovacuum_work_mem | Memory used by autovacuum workers for maintenance. | Per autovacuum worker. |
+| effective_cache_size | Planner estimate of cache available from PostgreSQL + OS cache. | Does NOT allocate memory. |
+| temp_buffers | Memory for temporary tables per session. | Session-specific. |
+| huge_pages | Uses larger memory pages when supported by OS. | Reduces page-management overhead. |
+| max_worker_processes | Cluster-wide ceiling for background/parallel workers. | Upper ceiling. |
+| max_parallel_workers | Parallel worker ceiling. | Must fit under max_worker_processes. |
+| max_parallel_workers_per_gather | Max parallel workers for one Gather/Gather Merge. | One query's parallelism ceiling. |
+
+> ⭐ effective_cache_size is a planner estimate, not allocated RAM. Higher values can make index plans look cheaper; lower values can make sequential scans more attractive.
+
+## 4.1 Parallel worker hierarchy
+
+```text
+max_worker_processes ≥ max_parallel_workers ≥ max_parallel_workers_per_gather
+```
+
+- Each parallel worker is a separate process with its own CPU and memory usage.
+- The optimizer decides whether parallelism is worthwhile.
+- Test session-level changes before making cluster-wide changes.
+
+# 5. Query Performance & EXPLAIN
+
+## 5.1 EXPLAIN vs EXPLAIN ANALYZE
+
+| Command | What it does |
+|---|---|
+| EXPLAIN | Planner estimates the execution plan; query is not executed. |
+| EXPLAIN ANALYZE | Executes the query and reports actual rows/time/loops in addition to estimates. |
+| EXPLAIN (ANALYZE, BUFFERS) | Adds buffer activity such as shared hit/read/dirtied/written. |
+
+Important: EXPLAIN ANALYZE on INSERT/UPDATE/DELETE really executes the statement. For a safe test, use a transaction and ROLLBACK.
+
+```sql
+BEGIN;
+EXPLAIN (ANALYZE, BUFFERS) UPDATE employee SET salary = 50000 WHERE employee_id = 10;
+ROLLBACK;
+```
+
+## 5.2 Buffer terminology
+
+| Metric | Meaning |
+|---|---|
+| shared hit | Page already found in shared_buffers. |
+| shared read | Page had to be read from storage/OS cache into shared_buffers. |
+| shared dirtied | Page was modified in shared_buffers. |
+| shared written | Dirty page was written out during the query. |
+
+## 5.3 Estimated vs actual rows
+
+ANALYZE updates pg_statistic information used by the planner. If estimated rows and actual rows differ greatly, stale or unrepresentative statistics may cause a poor plan.
+
+```sql
+ANALYZE employee;
+VACUUM (ANALYZE) employee;
+```
+
+> ⭐ Estimated rows = what planner expected. Actual rows = what execution really produced. A large mismatch is a strong troubleshooting clue.
+
+## 5.4 Planner cost parameters
+
+| Parameter | Meaning |
+|---|---|
+| random_page_cost | Estimated cost of random page access relative to sequential access. |
+| seq_page_cost | Estimated cost of sequential page access. |
+| cpu_tuple_cost | CPU cost for processing a row. |
+| cpu_index_tuple_cost | CPU cost for processing an index entry. |
+| effective_cache_size | Planner estimate of cache availability. |
+
+## 5.5 Work_mem and disk spill
+
+Sorts and hash operations can use work_mem. If an operation needs more memory than available for that operation, it can spill to temporary files.
+
+> ⭐ High temp-file usage or disk-based sorts/hashes can be a sign that work_mem is insufficient for that workload — but increasing it globally can also increase memory pressure.
+
+# 6. Scan Types & Join Methods
+
+## 6.1 Sequential Scan vs Index Scan vs Bitmap Scan
+
+| Method | Simple meaning | Good fit |
+|---|---|---|
+| Seq Scan | Reads the table sequentially. | Large portion of table must be read; small tables; planner cost favors it. |
+| Index Scan | Uses an index to find matching entries, then fetches heap rows. | Selective lookups. |
+| Bitmap Index Scan + Bitmap Heap Scan | Builds a bitmap of matching heap locations, then fetches table pages efficiently. | Many matching rows where individual random index lookups would be expensive. |
+
+> ⭐ B-tree = index structure. Bitmap Index Scan = execution method that can use an index to find many matching rows.
+
+## 6.2 Join methods
+
+| Join | How it works | Good fit / tuning clue |
+|---|---|---|
+| Nested Loop | For each outer row, find matching inner rows. | Small outer input + indexed inner join column. |
+| Hash Join | Build hash table from one input, probe it with the other. | Equality joins; enough work_mem reduces batching. |
+| Merge Join | Processes two sorted inputs together. | Large inputs where sorted/indexed inputs are useful. |
+
+## 6.3 Hash join memory
+
+The hash table uses work_mem multiplied by hash_mem_multiplier. If the hash table does not fit, PostgreSQL may use multiple batches, which can increase execution time.
+
+```sql
+SET enable_hashjoin = off;
+SET enable_mergejoin = off;
+SET enable_nestloop = off;
+```
+
+These settings are useful for testing/comparison, not as a normal tuning solution.
+
+# 7. PostgreSQL Indexes
+
+| Index | Best fit | Memory line |
+|---|---|---|
+| B-tree | Equality, range, ordering, BETWEEN, IN, IS NULL. | Default general-purpose index. |
+| Hash | Equality only. | Narrow use case; no ordering/range. |
+| GiST | Ranges, overlap, containment, geometric/nearest-neighbor workloads. | Flexible generalized search tree. |
+| SP-GiST | Naturally partitionable/non-balanced data such as prefixes/IP structures. | Space-partitioned access method. |
+| GIN | Arrays, JSONB containment, full-text style multi-value searches. | Value → matching rows. |
+| BRIN | Huge naturally ordered tables such as time-series data. | Tiny summary index; relies on physical correlation. |
+
+## 7.1 Useful index commands
+
+```sql
+CREATE INDEX idx_emp_salary ON employees(salary);
+CREATE INDEX idx_name ON table_name USING btree (column_name);
+CREATE INDEX CONCURRENTLY idx_name ON table_name (column_name);
+
+SELECT indexname, indexdef
+FROM pg_indexes
+WHERE tablename = 'table_name';
+
+SELECT *
+FROM pg_stat_user_indexes
+WHERE relname = 'table_name';
+
+SELECT pg_size_pretty(pg_relation_size('idx_name'));
+
+REINDEX INDEX CONCURRENTLY idx_name;
+```
+
+## 7.2 Index strategy
+
+- Start with the query pattern, not simply the data type.
+- WHERE / JOIN / ORDER BY columns are common index candidates.
+- Avoid unnecessary indexes because indexes add storage and write/maintenance cost.
+- An index existing does not guarantee the planner will use it.
+- Use EXPLAIN (ANALYZE, BUFFERS) to verify actual behavior.
+
+# 8. VACUUM, ANALYZE, AUTOVACUUM & Bloat
+
+| Operation | Purpose | Lock / space behavior |
+|---|---|---|
+| VACUUM | Removes dead tuples and makes space reusable inside the table; updates FSM/VM. | Allows normal reads/writes; does not normally return file space to OS. |
+| VACUUM FULL | Rewrites the table and returns unused space to OS. | ACCESS EXCLUSIVE; blocks normal activity on that table. |
+| ANALYZE | Refreshes planner statistics. | Statistics maintenance. |
+| pg_repack | Online table/index reorganization with a short final lock. | Useful when long blocking from VACUUM FULL is unacceptable. |
+
+## 8.1 Autovacuum trigger formula
+
+```sql
+VACUUM trigger =
+autovacuum_vacuum_threshold
++
+(autovacuum_vacuum_scale_factor × estimated table rows)
+```
+
+Example: threshold 50 + (0.2 × 10,000 rows) = about 2,050 dead tuples.
+
+| Parameter | Purpose |
+|---|---|
+| autovacuum | Enable automatic vacuum/analyze. |
+| autovacuum_max_workers | Number of autovacuum workers. |
+| autovacuum_naptime | Delay between autovacuum launcher checks. |
+| autovacuum_vacuum_threshold | Fixed dead-tuple threshold. |
+| autovacuum_vacuum_scale_factor | Fraction of table size added to threshold. |
+| autovacuum_analyze_threshold | Fixed threshold for analyze. |
+| autovacuum_analyze_scale_factor | Fraction used for analyze trigger. |
+| autovacuum_freeze_max_age | Age threshold related to transaction ID freezing. |
+
+## 8.2 Why autovacuum may not clean dead tuples
+
+- Long-running transactions can keep old row versions visible.
+- Hot standby feedback can prevent cleanup needed by standby queries.
+- Replication slots can retain WAL and contribute to operational pressure.
+- Autovacuum settings may be too conservative.
+- Autovacuum may be disabled or unable to keep up.
+- Investigate pg_stat_activity, pg_stat_user_tables, pg_stat_progress_vacuum, pg_replication_slots and relevant settings.
+
+# 9. Transactions, MVCC, Locks & XID Wraparound
+
+## 9.1 MVCC
+
+PostgreSQL uses Multi-Version Concurrency Control. UPDATE creates a new row version rather than simply overwriting the old version. Readers use transaction snapshots to determine which version they can see.
+
+| System column | Meaning |
+|---|---|
+| xmin | Transaction ID that created the row version. |
+| xmax | Transaction ID associated with deleting/updating the row version. |
+| ctid | Physical tuple location; can change when a row is updated. |
+
+> ⭐ MVCC allows readers and writers to operate concurrently by keeping multiple row versions.
+
+## 9.2 XID wraparound
+
+Transaction IDs are 32-bit and wrap around. PostgreSQL freezes old tuples so very old transaction IDs are not confused with new transaction IDs after wraparound.
+
+```sql
+SELECT datname, age(datfrozenxid)
+FROM pg_database;
+
+SELECT relname, age(relfrozenxid)
+FROM pg_class;
+```
+
+> ⭐ VACUUM/AUTOVACUUM + freezing protects PostgreSQL from transaction ID wraparound.
+
+## 9.3 Locks and deadlocks
+
+| Concept | Meaning |
+|---|---|
+| Row-level lock | Protects affected rows from conflicting operations. |
+| Table-level lock | Controls access to table-level operations. |
+| Blocked session | Waiting for another session's lock/resource. |
+| Blocking session | Holding the resource needed by another session. |
+| Deadlock | Two or more transactions wait for each other in a cycle. |
+
+```sql
+SELECT pid, xact_start, wait_event, wait_event_type,
+       pg_blocking_pids(pid)
+FROM pg_stat_activity;
+```
+
+Before terminating a session, identify what it is doing. Prefer pg_cancel_backend() for a softer query cancellation; use pg_terminate_backend() when the whole backend must be terminated and it is operationally safe.
+
+# 10. PostgreSQL Storage Internals
+
+## 10.1 Data directory — important folders
+
+| Directory | Purpose |
+|---|---|
+| base/ | Per-database relation files. |
+| global/ | Cluster-wide system catalogs. |
+| pg_tblspc/ | Links to user-defined tablespace locations. |
+| pg_xact/ | Transaction commit/abort status. |
+| pg_commit_ts/ | Commit timestamps when enabled. |
+| pg_twophase/ | Prepared two-phase transaction state. |
+| pg_subtrans/ | Subtransaction → parent transaction relationships. |
+| pg_replslot/ | Physical and logical replication slot state. |
+| pg_logical/ | Logical decoding working data. |
+| pg_dynshmem/ | Dynamic shared-memory related files. |
+| pg_stat/ / pg_stat_tmp/ | Statistics-related storage; newer versions use shared memory heavily for stats. |
+
+## 10.2 Relation files
+
+Tables and indexes have relation files identified by relfilenode. Large relations are split into segment files.
+
+```sql
+SELECT pg_relation_filepath('table_name');
+```
+
+| File | Purpose |
+|---|---|
+| main relation file | Main table/index data. |
+| _fsm | Free Space Map — tracks free space available on pages. |
+| _vm | Visibility Map — tracks pages marked all-visible and all-frozen where applicable. |
+
+## 10.3 Visibility Map — simple explanation
+
+```text
+Heap page 1 → all-visible ✓
+Heap page 2 → not all-visible ✗
+Heap page 3 → all-visible ✓
+```
+
+All-visible means PostgreSQL knows that tuples on that heap page are visible to all relevant transactions, so an Index-Only Scan can often avoid visiting the heap just to perform visibility checks.
+
+> ⭐ VM = visibility. FSM = free space.
+
+## 10.4 Tablespaces and schemas
+
+| Concept | Remember |
+|---|---|
+| pg_default | Default tablespace for normal objects. |
+| pg_global | Shared cluster-wide catalogs. |
+| temp_tablespaces | Where temporary objects/sort spill files can be placed. |
+| Schema | Logical namespace inside a database. |
+| pg_catalog | System catalogs/functions. |
+| information_schema | Standard SQL metadata views. |
+| public | General-purpose schema; PostgreSQL 15+ changes default ownership/CREATE behavior. |
+
+# 11. WAL, Checkpoints & Background Writing
+
+## 11.1 WAL
+
+Write-Ahead Logging means required WAL records are written before the corresponding data pages are considered durable. WAL is central to crash recovery, replication and PITR.
+
+| Item | Purpose |
+|---|---|
+| pg_wal/ | Stores WAL segment files. |
+| pg_waldump | Reads/decodes WAL records for investigation. |
+| pg_stat_wal | WAL generation/flush statistics. |
+| pg_switch_wal() | Forces a WAL segment switch. |
+| min_wal_size | Minimum WAL disk space PostgreSQL tries to keep available for reuse. |
+| max_wal_size | Soft WAL size target that influences when checkpoints are triggered. |
+
+## 11.2 Checkpoints
+
+| Checkpoint trigger | Meaning |
+|---|---|
+| Time-based | checkpoint_timeout interval reached. |
+| Size-based | WAL volume reaches max_wal_size. |
+| Manual | CHECKPOINT command. |
+
+checkpoint_completion_target spreads checkpoint writes across the checkpoint interval to smooth I/O.
+
+> ⭐ Prefer a workload where checkpoints are mostly timed rather than constantly requested because max_wal_size is being reached too quickly.
+
+## 11.3 Background writer / checkpointer / WAL writer
+
+| Component | High-level responsibility |
+|---|---|
+| WAL writer | Writes WAL records from WAL buffers toward WAL files. |
+| Checkpointer | Writes dirty data pages as part of checkpoints. |
+| Background writer | Writes some dirty buffers in the background to keep clean buffers available. |
+
+## 11.4 pg_stat_bgwriter clues
+
+| Metric | Interpretation |
+|---|---|
+| checkpoints_timed | Timed checkpoints. |
+| checkpoints_req | Requested/forced checkpoints; high values can indicate WAL pressure. |
+| buffers_checkpoint | Buffers written during checkpoints. |
+| buffers_clean | Buffers written by background writer. |
+| buffers_backend | Buffers written directly by client backends; high values can indicate pressure. |
+
+# 12. Physical Streaming Replication
+
+## 12.1 Architecture
+
+```text
+PRIMARY
+  │
+  │ WAL
+  ▼
+WAL Sender
+  │
+  │ streaming
+  ▼
+WAL Receiver
+  │
+  ▼
+Standby WAL
+  │
+  ▼
+WAL Replay
+  │
+  ▼
+Standby database
+```
+
+> ⭐ Physical streaming replication = WAL-based replication from primary to standby.
+
+## 12.2 LSNs
+
+| LSN | Meaning |
+|---|---|
+| sent_lsn | WAL sent by primary up to this point. |
+| write_lsn | WAL received and written to standby WAL files. |
+| flush_lsn | WAL flushed/synced to durable storage on standby. |
+| replay_lsn | WAL actually replayed/applied on standby. |
+
+A gap between sent and write points toward network/receiving delay; write→flush points toward standby storage latency; flush→replay points toward replay/CPU/read-workload pressure.
+
+```sql
+SELECT * FROM pg_stat_replication;
+SELECT * FROM pg_stat_wal_receiver;
+SELECT pg_is_in_recovery();
+```
+
+## 12.3 Basic physical replication setup
+
+```text
+wal_level = replica
+archive_mode = on
+wal_keep_size = 100MB        # example from notes; choose based on workload
+wal_log_hints = on            # useful for pg_rewind
+
+CREATE ROLE repuser WITH REPLICATION LOGIN PASSWORD '...';
+
+# pg_hba.conf on primary:
+host replication repuser <standby-address>/<mask> scram-sha-256
+
+pg_basebackup -D /dba_instance/standby   -U repuser -p 5432 -h <primary> -P -R
+```
+
+- A standby.signal file indicates standby/recovery mode for modern PostgreSQL.
+- The standby connects using primary_conninfo.
+- By default, streaming replication is asynchronous unless synchronous replication is configured.
+- Multiple standbys use WAL sender processes on the primary and WAL receiver processes on each standby.
+
+## 12.4 Replication slots
+
+A replication slot retains WAL required by a standby or logical subscriber. This prevents required WAL from being recycled before the consumer receives it.
+
+| Benefit | Risk |
+|---|---|
+| Standby can reconnect and continue from retained WAL without an immediate new base backup. | A long-down/inactive consumer can cause pg_wal to grow until disk space is exhausted. |
+
+```sql
+SELECT slot_name, active, restart_lsn
+FROM pg_replication_slots;
+```
+
+> ⭐ Replication slot = protects required WAL, but a neglected slot can fill the primary's disk.
+
+## 12.5 Common replication lag causes
+
+- Network/receive delay.
+- Standby disk I/O bottleneck.
+- Standby CPU/replay bottleneck.
+- Heavy read workload causing replay conflicts/delay.
+- Primary generating WAL faster than standby can receive/replay.
+- Replication slot/WAL retention problems.
+- Storage capacity or infrastructure problems.
+
+## 12.6 Failover and pg_rewind
+
+After a standby is promoted, the old primary may have diverged onto a different timeline. pg_rewind can bring the old primary back in sync with the new primary by copying changed blocks from the divergence point, avoiding a full base backup when prerequisites are satisfied.
+
+> ⭐ pg_rewind = rejoin old primary after failover, when the old and new timelines diverged.
+
+The old server generally needs either data checksums enabled or wal_log_hints enabled so changed blocks can be identified.
+
+# 13. Logical Replication
+
+| Concept | Meaning |
+|---|---|
+| Publisher | Source side where publications are defined. |
+| Publication | Defines which tables/operations are published. |
+| Subscriber | Destination side that subscribes to publications. |
+| Table sync worker | Used during initial table synchronization. |
+| Apply worker | Applies logical changes on subscriber. |
+| Replication slot | Tracks logical decoding progress. |
+
+- Logical replication replicates row-level changes rather than the whole physical database.
+- Table structure is not automatically reproduced as a physical copy; the target schema must be prepared appropriately.
+- Primary keys are important for identifying rows for UPDATE/DELETE in common configurations.
+- pglogical is an extension that provides additional logical-replication capabilities.
+
+# 14. Backup, Restore & PITR
+
+## 14.1 Logical vs physical
+
+| Backup | What it contains | Use |
+|---|---|---|
+| pg_dump | Logical objects/data for one database. | Migration, selective restore, logical backup. |
+| pg_dumpall | Cluster-wide logical SQL, including global objects. | Logical cluster-level dump. |
+| pg_basebackup | Physical base backup of a PostgreSQL cluster. | Standby creation, physical restore/PITR foundation. |
+| pgBackRest | Physical backup/restore platform with full/diff/incr, WAL archive and PITR features. | Production backup/DR. |
+
+> ⭐ PITR needs a physical base backup + continuous WAL archiving/replay. pg_dump alone cannot provide physical WAL-based PITR.
+
+## 14.2 PITR flow
+
+```text
+PRIMARY
+  │
+  ├── Base backup (pg_basebackup / pgBackRest)
+  │
+  └── WAL archive
+          │
+          ▼
+      RESTORE SERVER
+          │
+          ├── restore base backup
+          ├── restore_command
+          ├── recovery.signal
+          └── recovery_target_time
+                    │
+                    ▼
+               WAL replay
+                    │
+                    ▼
+              target timestamp
+                    │
+                    ▼
+                pg_promote()
+```
+
+## 14.3 Practical PITR steps
+
+```text
+archive_mode = on
+archive_command = 'scp %p osuser@archive-server:/archive/%f'
+
+SELECT pg_switch_wal();
+
+pg_basebackup -p 5432 -h <primary> -D /backup/basebackup -P -c fast
+
+# On restore server:
+restore_command = 'cp /archive/%f %p'
+recovery_target_time = '2026-09-06 11:59:00'
+touch recovery.signal
+
+SELECT pg_is_in_recovery();
+
+# After validating the recovered point:
+SELECT pg_promote();
+```
+
+- restore_command: %f is the WAL filename requested; %p is the destination path PostgreSQL provides.
+- log_statement='ddl' logs DDL such as CREATE/ALTER/DROP/TRUNCATE; it does not log INSERT/UPDATE/DELETE.
+- pg_wal_replay_resume() resumes paused replay; it does not itself end recovery. pg_promote() promotes a recovered server to normal read-write operation.
+
+## 14.4 Accidental table drop scenario
+
+- Restore the physical base backup to a separate recovery server.
+- Configure WAL restore and the recovery target before the destructive event.
+- Replay WAL until just before/at the required point.
+- Verify with pg_is_in_recovery() and validate the target data.
+- Export only the required object/data if needed and restore it to production.
+- Avoid using PITR directly on production when a separate recovery server can isolate the operation.
+
+# 15. pgBackRest
+
+## 15.1 Core concepts
+
+| Concept | Remember |
+|---|---|
+| Stanza | Identity/name for a PostgreSQL cluster configuration in pgBackRest. |
+| Archive-push | Moves WAL into the pgBackRest repository. |
+| Full | Complete backup. |
+| Differential | Changes since the last full backup. |
+| Incremental | Changes since the latest applicable backup. |
+| Retention | Controls how many backups are retained. |
+| Restore | Restores a physical backup to a target data directory. |
+| PITR | Restore a backup and replay WAL to a target time. |
+
+```text
+[global]
+repo1-path=/dba_instance/dbrepo
+repo1-retention-full=2
+process-max=2
+start-fast=y
+
+[main]
+pg1-path=/var/lib/pgsql/17/data
+pg1-port=5432
+
+archive_command = 'pgbackrest --stanza=main archive-push %p'
+
+pgbackrest --stanza=main stanza-create
+pgbackrest --stanza=main backup --type=full
+pgbackrest --stanza=main backup --type=diff
+pgbackrest --stanza=main backup --type=incr
+
+pgbackrest info --stanza=main
+pgbackrest --stanza=main restore
+pgbackrest --stanza=main --set=<backup-set> restore
+pgbackrest --stanza=main --type=time --target="YYYY-MM-DD HH:MI:SS" restore
+```
+
+> ⭐ pgBackRest = production-oriented physical backup + WAL archive + restore + PITR platform.
+
+## 15.2 Backup verification
+
+A backup is not trustworthy until it has been restored/tested. Periodically restore to a test/DR environment and validate PostgreSQL startup, data availability and required objects.
+
+# 16. PgBouncer Connection Pooling
+
+## 16.1 Why PgBouncer?
+
+PostgreSQL uses a process per connection. Large numbers of client connections can create memory and process overhead. PgBouncer keeps many client connections while maintaining a smaller pool of PostgreSQL server connections.
+
+| Setting | Meaning |
+|---|---|
+| max_client_conn | Maximum client connections accepted by PgBouncer. |
+| default_pool_size | Default number of server connections per user/database pool. |
+| reserve_pool_size | Extra server connections allowed during bursts. |
+| reserve_pool_timeout | How long before reserve connections can be used. |
+| max_db_connections | Hard cap for backend connections to a database. |
+
+## 16.2 Pooling modes
+
+| Mode | Behavior | Important limitation |
+|---|---|---|
+| session | Backend connection stays with client until disconnect. | Highest compatibility; lower pooling efficiency. |
+| transaction | Backend connection is returned after COMMIT/ROLLBACK. | Session-level state such as SET, LISTEN/NOTIFY, prepared statements and session advisory locks can cause problems. |
+| statement | Connection returned after each statement. | Most restrictive; not suitable for transaction-dependent workloads. |
+
+> ⭐ Transaction pooling = excellent connection reuse, but do not assume the same PostgreSQL backend belongs to the client across transactions.
+
+## 16.3 PgBouncer troubleshooting
+
+- SHOW POOLS — look for cl_waiting and server connection usage.
+- SHOW CLIENTS — inspect client-side state.
+- SHOW SERVERS — inspect actual PostgreSQL backend connections.
+- SHOW STATS — query counts and average timings.
+- High cl_waiting can mean pool exhaustion, long transactions, slow queries or undersized pools.
+- Also check PostgreSQL max_connections, max_db_connections, max_user_connections and idle-in-transaction sessions.
+- For prepared-statement issues in transaction pooling, use driver-specific workarounds, PgBouncer prepared-statement support where appropriate, or session pooling.
+
+# 17. PostgreSQL High Availability
+
+## 17.1 Patroni
+
+Patroni is an HA framework for PostgreSQL. It manages leader election/failover using a distributed configuration store (DCS) and coordinates PostgreSQL roles.
+
+| Concept | Remember |
+|---|---|
+| Leader lock | Patroni continuously renews the leader key/lock before its TTL expires. |
+| DCS | Distributed store used for cluster coordination; examples include etcd/Consul/ZooKeeper. |
+| Failover | Promotion of a suitable replica when the leader is lost. |
+| Switchover | Planned role change. |
+| patronictl list | Quick cluster health/role view. |
+| HAProxy | Can route client traffic toward the appropriate PostgreSQL node. |
+
+## 17.2 repmgr
+
+repmgr provides PostgreSQL replication/cluster management features such as monitoring, switchover/failover and standby registration. For interviews, understand the purpose and operational workflow rather than memorizing installation commands.
+
+## 17.3 HAProxy + PgBouncer
+
+```text
+Application
+    ↓
+HAProxy / connection layer
+    ↓
+PgBouncer (optional)
+    ↓
+Current PostgreSQL primary
+    ├── standby
+    └── standby
+```
+
+The exact architecture depends on the HA tooling and environment.
+
+# 18. Extensions & Useful PostgreSQL Tools
+
+| Extension/tool | Use |
+|---|---|
+| pg_buffercache | Inspect contents/status of shared buffers. |
+| pg_stat_statements | Identify query execution statistics and expensive SQL. |
+| pg_repack | Online table/index reorganization. |
+| pgstattuple | Inspect table/index bloat and tuple statistics. |
+| pg_freespacemap | Inspect free-space map information. |
+| pg_visibility | Inspect visibility-map information. |
+| pglogical | Additional logical replication functionality. |
+| pg_waldump | Inspect WAL records. |
+| pg_rewind | Rejoin an old primary after failover when prerequisites are met. |
+
+The notes also mention passwordcheck. It is a contrib module loaded through shared_preload_libraries rather than enabled with CREATE EXTENSION, and it enforces basic password-strength rules.
+
+# 19. PostgreSQL Partitioning
+
+Partitioning splits one logical table into smaller physical partitions while the application can query the parent table.
+
+| Type | Use |
+|---|---|
+| RANGE | Ranges such as dates or numeric ranges. |
+| LIST | Specific values/categories. |
+| HASH | Distribute rows based on a hash of the partition key. |
+
+```sql
+CREATE TABLE orders (
+    order_id bigint,
+    order_date date,
+    customer_id bigint
+) PARTITION BY RANGE (order_date);
+```
+
+## 19.1 Partition pruning
+
+When a query contains a condition that lets PostgreSQL identify which partitions can contain the requested rows, PostgreSQL can avoid scanning irrelevant partitions.
+
+> ⭐ RANGE → dates/ranges | LIST → categories | HASH → distribution | PRUNING → skip irrelevant partitions
+
+# 20. Monitoring & DBA Troubleshooting Workflow
+
+## 20.1 Views to know
+
+| View | Use |
+|---|---|
+| pg_stat_activity | Sessions, queries, waits, transactions. |
+| pg_stat_replication | Primary-side replication status. |
+| pg_stat_wal_receiver | Standby-side WAL receiver status. |
+| pg_stat_user_tables | Table activity, dead tuples, vacuum/analyze information. |
+| pg_stat_user_indexes | Index usage statistics. |
+| pg_locks | Locks and lock conflicts. |
+| pg_replication_slots | Replication slot state and WAL retention position. |
+| pg_stat_progress_vacuum | Vacuum progress. |
+| pg_stat_wal | WAL activity. |
+| pg_settings | Effective configuration and source/context information. |
+| pg_database | Database-level information. |
+
+## 20.2 Slow query troubleshooting sequence
+
+```text
+1. pg_stat_activity
+2. Check waits / blocking / transaction age
+3. EXPLAIN (ANALYZE, BUFFERS)
+4. Compare estimated vs actual rows
+5. Check Seq Scan / Index Scan / Bitmap Scan
+6. Check Nested Loop / Hash Join / Merge Join
+7. Check statistics / ANALYZE
+8. Check index usage and bloat
+9. Check work_mem / temp spills
+10. Check CPU / memory / disk I/O
+11. Check recent data/config/schema changes
+```
+
+## 20.3 General database slowdown sequence
+
+CPU / Memory
+   ↓
+Disk space / IOPS / latency
+   ↓
+Connections
+   ↓
+Long-running / blocked sessions
+   ↓
+Locks
+   ↓
+Slow queries / execution plans
+   ↓
+VACUUM / autovacuum
+   ↓
+Table / index bloat
+   ↓
+WAL generation / checkpoints
+   ↓
+Replication lag
+   ↓
+Backup status
+   ↓
+Logs
+```
+
+> ⭐ Do not immediately blame the query. First determine whether it is executing, waiting, blocked, or suffering from system/resource pressure.
+
+# 21. AWS Basics for a PostgreSQL DBA
+
+| AWS service | DBA-level understanding |
+|---|---|
+| EC2 | Virtual server where you manage OS + PostgreSQL yourself. |
+| EBS | Persistent block storage used for PostgreSQL data/WAL; think volume size, IOPS, throughput and snapshots. |
+| S3 | Object storage commonly used for backup/WAL archives. |
+| RDS PostgreSQL | Managed PostgreSQL service where AWS manages much of the infrastructure. |
+| VPC | Network boundary with subnets. |
+| Security Group | Network firewall controlling inbound/outbound traffic. |
+| IAM | Controls access to AWS resources. |
+| CloudWatch | Monitoring/metrics/alarms for AWS resources. |
+
+> 🎤 Interview answer: If an application server needs PostgreSQL access, allow TCP 5432 from the application's security group to the database security group rather than opening 5432 to the entire internet.
+
+# 22. SQL Fundamentals & Database Objects
+
+## 22.1 Keys and constraints
+
+| Constraint | One-line meaning |
+|---|---|
+| NOT NULL | Column must contain a value. |
+| UNIQUE | Prevents duplicate values for the constrained key/column set; NULL behavior depends on DBMS semantics. |
+| PRIMARY KEY | Main unique identifier; NOT NULL + unique; one PK constraint per table. |
+| FOREIGN KEY | Enforces a relationship to a referenced key in another table. |
+| CHECK | Value must satisfy a defined condition. |
+| DEFAULT | Provides a value when one is not explicitly supplied. |
+| Composite key | Key made from more than one column. |
+
+> ⭐ PK = identifies the row. FK = relationship. UNIQUE = no duplicate key values. CHECK = rule. DEFAULT = automatic value.
+
+## 22.2 View vs stored procedure vs function vs window function
+
+| Object | Simple meaning |
+|---|---|
+| View | Virtual query result used to simplify/reuse/secure data access. |
+| Stored procedure | Callable database program used to perform operations; can accept parameters and perform transactional work depending on DBMS. |
+| Function | Returns a value/result and can be used in expressions/queries depending on DBMS. |
+| Window function | Calculates across related rows using OVER() while keeping individual rows in the result. |
+
+> ⭐ Procedure → you call it to perform work. Trigger → database automatically fires it when its event occurs.
+
+## 22.3 Triggers
+
+A trigger automatically executes predefined logic when a specified event occurs.
+
+```text
+User action
+   ↓
+INSERT / UPDATE / DELETE / DDL event
+   ↓
+Trigger fires automatically
+   ↓
+Audit / validation / related action
+```
+
+Common uses: auditing changes, automatic logging, enforcing business rules and maintaining related data. The source notes include SQL Server DML, DDL and LOGON trigger types.
+
+# 23. DBA Automation: Ansible & Bash
+
+## 23.1 Ansible
+
+| Concept | Interview line |
+|---|---|
+| Agentless | Uses remote management such as SSH rather than a persistent agent on every target. |
+| Idempotent | Repeated execution aims to produce the same desired end state without unintended repeated changes. |
+| Automation | Useful for configuration, patching, deployments and standardized DBA operations. |
+
+> 🎤 Interview answer: For a Patroni cluster patch, patch replicas one at a time, verify health after each node, then perform a controlled switchover and patch the former primary.
+
+## 23.2 Bash/Linux tools
+
+| Tool | Typical DBA use |
+|---|---|
+| grep | Search logs/text. |
+| awk | Extract/process columns and patterns. |
+| sed | Text transformation. |
+| ssh | Remote execution. |
+| cron | Scheduled jobs. |
+| top | CPU/process overview. |
+| vmstat | CPU/memory/system activity. |
+| iostat | Disk I/O. |
+| df -h | Filesystem capacity. |
+| free | Memory information. |
+
+# 24. Scenario-Based Interview Answers
+
+## 24.1 Standby is lagging
+
+> 🎤 Interview answer: I would first check pg_stat_replication on the primary and compare sent_lsn, write_lsn, flush_lsn and replay_lsn. Then I would check pg_stat_wal_receiver on the standby. The position of the gap tells me whether the issue is network/receive, standby storage, or WAL replay/CPU. I would also check standby CPU, disk latency, long-running queries, conflicts, WAL generation on the primary, replication slots and PostgreSQL logs.
+
+## 24.2 WAL is growing rapidly
+
+> 🎤 Interview answer: I would check pg_replication_slots first for inactive or stalled slots, then check replication lag and WAL archiving. I would identify whether a standby or logical subscriber is retaining WAL. I would also check pg_stat_wal and the rate of WAL generation, then address the root cause before deleting a slot. If a slot is permanently unused, it can be safely removed after confirming it is no longer required.
+
+## 24.3 Query suddenly became slow
+
+> 🎤 Interview answer: I would compare the current plan with a known good plan, run EXPLAIN (ANALYZE, BUFFERS), check estimated versus actual rows, scan type, join method, statistics, data growth and data skew. Then I would check index usage/bloat, temporary spills, CPU, memory and disk I/O. I would also verify whether the query is actually running or waiting on a lock.
+
+## 24.4 Connections are exhausted
+
+> 🎤 Interview answer: I would check pg_stat_activity to understand who is consuming connections and whether sessions are idle or idle in transaction. I would verify max_connections and any role/database connection limits. If the application creates many short-lived connections, I would consider PgBouncer, usually transaction pooling where the application is compatible, and then tune pool sizes based on PostgreSQL capacity.
+
+## 24.5 Autovacuum is not cleaning dead tuples
+
+> 🎤 Interview answer: I would identify the table and dead tuple count in pg_stat_user_tables, check pg_stat_progress_vacuum and autovacuum settings, then investigate long-running transactions, hot standby feedback, replication-related retention and whether autovacuum is disabled or unable to keep up. I would also check transaction age for wraparound risk.
+
+## 24.6 Blocking session
+
+> 🎤 Interview answer: I would check pg_stat_activity, wait_event and pg_blocking_pids() to identify the blocker. Then I would inspect pg_locks and the transaction age/query. Before terminating anything, I would confirm the session is not performing a critical operation. If appropriate, I would cancel the query first and terminate the backend only when necessary.
+
+## 24.7 Accidental table drop
+
+> 🎤 Interview answer: I would use a separate recovery server. I would restore the physical base backup, configure restore_command and recovery.signal, set the recovery target to just before the destructive event, replay WAL, verify the table, export the required object/data, and restore that data to production. I would avoid taking production offline unless there is a specific reason.
+
+## 24.8 Old primary after failover
+
+> 🎤 Interview answer: After the standby is promoted, the old primary is on the old timeline and may have divergent changes. If prerequisites such as data checksums or wal_log_hints are available, I would use pg_rewind to synchronize the old primary with the new primary. If pg_rewind cannot be used, I would rebuild the old primary from a new base backup.
+
+# 25. High-Probability Interview Questions — One-Line Answers
+
+| Question | Answer to remember |
+|---|---|
+| What is PostgreSQL MVCC? | Multiple row versions allow readers and writers to work concurrently using transaction snapshots. |
+| What is VACUUM? | Cleans dead tuples and makes space reusable; it does not normally shrink the table file. |
+| VACUUM FULL? | Rewrites the table, returns free space to OS, and requires ACCESS EXCLUSIVE. |
+| Why ANALYZE? | Updates statistics used by the planner. |
+| Why autovacuum? | Automatically performs vacuum/analyze and helps prevent bloat and transaction ID wraparound. |
+| What is work_mem? | Memory available per query operation such as sort/hash; multiple operations/sessions can consume it. |
+| What is effective_cache_size? | Planner estimate of cache available; it does not allocate memory. |
+| What is a replication slot? | Tracks WAL consumption and prevents required WAL from being recycled. |
+| What is replication lag? | Standby/subscriber is behind the primary's WAL generation/replay position. |
+| What is pg_rewind? | Re-synchronizes an old primary with the new primary after failover when prerequisites are met. |
+| What is PITR? | Restore a physical base backup and replay WAL to a selected point in time. |
+| pg_dump vs pg_basebackup? | pg_dump is logical; pg_basebackup is physical. |
+| What is pgBackRest? | Physical backup/WAL archive/restore/PITR platform. |
+| What is PgBouncer? | Lightweight PostgreSQL connection pooler. |
+| Transaction pooling risk? | The same client may use different PostgreSQL backend sessions across transactions. |
+| What is a B-tree? | General-purpose ordered index for equality, ranges and sorting. |
+| What is GIN? | Inverted index useful for arrays, JSONB and multi-value/full-text searches. |
+| What is BRIN? | Very small summary index for huge naturally ordered tables. |
+| What is Bitmap Heap Scan? | Fetches matching heap pages based on a bitmap, often after a Bitmap Index Scan. |
+| Nested Loop? | For each outer row, find matching inner rows. |
+| Hash Join? | Build hash table then probe it for matching keys. |
+| Merge Join? | Merge two sorted inputs. |
+| What is a deadlock? | Transactions wait for each other's locks in a cycle. |
+| What is XID wraparound? | Risk caused by reuse of 32-bit transaction IDs; freezing prevents old rows being confused with new transactions. |
+| What is a checkpoint? | Flushes required dirty data pages and establishes a recovery point in WAL processing. |
+| What is WAL? | Write-ahead log used for durability, crash recovery, replication and PITR. |
+| What is Patroni? | HA framework that coordinates PostgreSQL leader election/failover using a DCS. |
+| What is HAProxy? | Traffic-routing/load-balancing layer commonly used with PostgreSQL HA. |
+| What is a partition? | Smaller physical piece of one logical table. |
+| What is partition pruning? | Skipping partitions that cannot contain the requested rows. |
+
+# 26. LAST-MINUTE POSTGRESQL DBA CHEAT SHEET
+
+> ⭐ Architecture: Connection → pg_hba.conf → Backend → Parse → Analyze → Rewrite → Plan → Execute
+
+> ⭐ Security: pg_hba.conf = connection. GRANT/roles = authorization.
+
+> ⭐ effective_cache_size = planner estimate, NOT allocated RAM.
+
+> ⭐ work_mem = per operation; sort/hash can use it multiple times.
+
+> ⭐ shared_buffers = PostgreSQL data cache.
+
+> ⭐ EXPLAIN = estimate. EXPLAIN ANALYZE = executes and shows actuals.
+
+> ⭐ shared hit = shared_buffers. shared read = had to read page. dirtied = changed. written = flushed during query.
+
+> ⭐ Estimated rows ≠ actual rows → check statistics / ANALYZE / data skew.
+
+> ⭐ Seq Scan vs Index Scan vs Bitmap Scan: planner chooses based on estimated cost/selectivity.
+
+> ⭐ Nested Loop = repeated inner lookup. Hash = build + probe. Merge = sorted inputs.
+
+> ⭐ B-tree = general. GIN = multi-value. GiST = overlap/distance/range. BRIN = huge ordered data.
+
+> ⭐ VACUUM = reuse space. VACUUM FULL = rewrite + return OS space + exclusive lock. ANALYZE = planner stats.
+
+> ⭐ VM = visibility. FSM = free space.
+
+> ⭐ MVCC = multiple row versions; xmin/xmax are key hidden columns.
+
+> ⭐ XID wraparound → freezing is required.
+
+> ⭐ WAL = durability + crash recovery + replication + PITR.
+
+> ⭐ Replication LSN order: sent → write → flush → replay.
+
+> ⭐ Replication slot protects required WAL; abandoned slot can fill pg_wal.
+
+> ⭐ pg_rewind = old primary → new primary timeline after failover.
+
+> ⭐ PITR = base backup + WAL archive + target time.
+
+> ⭐ pgBackRest = physical backup/restore/WAL/PITR platform.
+
+> ⭐ PgBouncer = connection pooling; transaction pooling can break session state.
+
+> ⭐ Patroni = HA/failover; DCS = cluster coordination; HAProxy = traffic routing.
+
+> ⭐ Partitioning: RANGE / LIST / HASH; pruning skips irrelevant partitions.
+
+> ⭐ Core monitoring: pg_stat_activity, pg_stat_replication, pg_stat_wal_receiver, pg_stat_user_tables, pg_stat_user_indexes, pg_locks, pg_replication_slots.
+
+> ⭐ Slow query workflow: activity → waits/locks → EXPLAIN ANALYZE BUFFERS → estimates vs actuals → scans/joins → stats/indexes → resources.
+
+> ⭐ WAL growth workflow: replication slots → archive → standby lag → WAL generation → disk space.
+
+> ⭐ Connection issue workflow: pg_stat_activity → idle/idle-in-transaction → limits → PgBouncer → pool sizing.
+
+> ⭐ Backup rule: never assume a backup works until you have restored/tested it.
+
+## The 10 concepts you should explain without hesitation
+
+1. PostgreSQL query processing flow
+
+2. MVCC and dead tuples
+
+3. VACUUM vs VACUUM FULL vs ANALYZE
+
+4. EXPLAIN ANALYZE + BUFFERS
+
+5. Index Scan vs Bitmap Scan vs Seq Scan
+
+6. Nested Loop vs Hash Join vs Merge Join
+
+7. WAL + checkpoints
+
+8. Physical streaming replication + LSNs + slots
+
+9. PITR / pgBackRest
+
+10. Patroni + PgBouncer + pg_rewind
+
+## Final interview mindset
+
+- Start with what you would check, not only the definition.
+- Use the relevant PostgreSQL view/command to prove the problem.
+- Separate symptom from root cause.
+- Mention impact: CPU, memory, disk, locks, WAL, replication or downtime.
+- For risky operations, mention validation, maintenance window, backup and rollback.
+- When an interviewer gives an ambiguous scenario, clarify the exact topology and failure condition before choosing a solution.
