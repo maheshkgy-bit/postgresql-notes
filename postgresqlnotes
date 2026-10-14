@@ -624,19 +624,20 @@ Standby database
 ## 12.2 LSNs
 
 | LSN | Meaning |
-|---|---|
-| sent_lsn | WAL sent by primary up to this point. |
-| write_lsn | WAL received and written to standby WAL files. |
-| flush_lsn | WAL flushed/synced to durable storage on standby. |
-| replay_lsn | WAL actually replayed/applied on standby. |
+| sent_lsn | WAL sent by primary up to this point. 
+| write_lsn | WAL received and written to standby WAL files. 
+| flush_lsn | WAL flushed/synced to durable storage on standby. 
+| replay_lsn | WAL actually replayed/applied on standby. 
 
-A gap between sent and write points toward network/receiving delay; write→flush points toward standby storage latency; flush→replay points toward replay/CPU/read-workload pressure.
+A gap between sent and write points toward network/receiving delay; 
+write→flush points toward standby storage latency; 
+flush→replay points toward replay/CPU/read-workload pressure.
 
-```sql
+sql
 SELECT * FROM pg_stat_replication;
 SELECT * FROM pg_stat_wal_receiver;
 SELECT pg_is_in_recovery();
-```
+
 
 ## 12.3 Basic physical replication setup
 
@@ -653,19 +654,19 @@ host replication repuser <standby-address>/<mask> scram-sha-256
 
 pg_basebackup -D /dba_instance/standby   -U repuser -p 5432 -h <primary> -P -R
 ```
-
 - A standby.signal file indicates standby/recovery mode for modern PostgreSQL.
 - The standby connects using primary_conninfo.
 - By default, streaming replication is asynchronous unless synchronous replication is configured.
 - Multiple standbys use WAL sender processes on the primary and WAL receiver processes on each standby.
 
 ## 12.4 Replication slots
-
-A replication slot retains WAL required by a standby or logical subscriber. This prevents required WAL from being recycled before the consumer receives it.
+A replication slot retains WAL required by a standby or logical subscriber. 
+This prevents required WAL from being recycled before the consumer receives it.
 
 | Benefit | Risk |
 |---|---|
-| Standby can reconnect and continue from retained WAL without an immediate new base backup. | A long-down/inactive consumer can cause pg_wal to grow until disk space is exhausted. |
+| Standby can reconnect and continue from retained WAL without an immediate new base backup. 
+| A long-down/inactive consumer can cause pg_wal to grow until disk space is exhausted. |
 
 ```sql
 SELECT slot_name, active, restart_lsn
@@ -685,8 +686,9 @@ FROM pg_replication_slots;
 - Storage capacity or infrastructure problems.
 
 ## 12.6 Failover and pg_rewind
-
-After a standby is promoted, the old primary may have diverged onto a different timeline. pg_rewind can bring the old primary back in sync with the new primary by copying changed blocks from the divergence point, avoiding a full base backup when prerequisites are satisfied.
+After a standby is promoted, the old primary may have diverged onto a different timeline. 
+pg_rewind can bring the old primary back in sync with the new primary by copying changed blocks from the divergence point,
+avoiding a full base backup when prerequisites are satisfied.
 
 > ⭐ pg_rewind = rejoin old primary after failover, when the old and new timelines diverged.
 
