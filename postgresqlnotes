@@ -474,13 +474,24 @@ FROM pg_class;
 | Blocking session | Holding the resource needed by another session. |
 | Deadlock | Two or more transactions wait for each other in a cycle. |
 
+Simple example
+Imagine Session 1 updates an employee's salary but has not committed the transaction.
+- Session 1 — Blocking session: Holds a lock on the employee's row.
+- Session 2 — Blocked session: Tries to update the same row but must wait until Session 1 releases the lock.
+Session	What it does
+Session 1	Holds the lock → Blocking
+Session 2	Waits for the lock → Blocked
+Easy way to remember: Blocking = making another session wait. Blocked = waiting for another session.
+
 ```sql
 SELECT pid, xact_start, wait_event, wait_event_type,
        pg_blocking_pids(pid)
 FROM pg_stat_activity;
 ```
 
-Before terminating a session, identify what it is doing. Prefer pg_cancel_backend() for a softer query cancellation; use pg_terminate_backend() when the whole backend must be terminated and it is operationally safe.
+Before terminating a session, identify what it is doing. 
+Prefer pg_cancel_backend() for a softer query cancellation; 
+use pg_terminate_backend() when the whole backend must be terminated and it is operationally safe.
 
 # 10. PostgreSQL Storage Internals
 
